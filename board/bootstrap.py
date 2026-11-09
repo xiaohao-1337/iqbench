@@ -2,14 +2,11 @@
 
 import json
 from pathlib import Path
-import runpy
+import re
 import signal
 import socket
 import sys
 import tempfile
-
-
-SCRIPTS = ("rkaiq_gray.py", "rkaiq_controls.py", "rkaiq_bridge.py", "rkaiq_media.py")
 
 
 def phase(name):
@@ -20,30 +17,39 @@ def interrupt(*_):
     raise KeyboardInterrupt
 
 
-signal.signal(signal.SIGHUP, interrupt)
-signal.signal(signal.SIGTERM, interrupt)
-try:
+def serve():
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as lock:
         try:
             lock.bind("\0rkaiq-win-panel")
         except OSError:
             raise OSError("该板卡已有调参会话，请先退出另一客户端") from None
         phase("upload")
-        line = sys.stdin.readline()
-        if line:
-            scripts = json.loads(line)
-            session = tempfile.TemporaryDirectory(prefix="rkaiq-panel-", dir="/tmp")
-            try:
+        session = None
+        try:
+            if line := sys.stdin.readline():
+                scripts = json.loads(line)
+                session = tempfile.TemporaryDirectory(prefix="rkaiq-panel-", dir="/tmp")
                 folder = Path(session.name)
-                for name in SCRIPTS:
-                    (folder / name).write_text(scripts[name], encoding="utf-8")
+                for name, source in scripts.items():
+                    if not re.fullmatch(r"rkaiq_[a-z_]+\.py", name):
+                        raise ValueError("无效的板端脚本文件名")
+                    (folder / name).write_text(source, encoding="utf-8")
                 sys.path.insert(0, session.name)
+                from rkaiq_bridge import main
+
                 phase("start")
-                runpy.run_path(str(folder / "rkaiq_bridge.py"), run_name="__main__")
-            finally:
+                main()
+        finally:
+            if session is not None:
                 session.cleanup()
-                phase("cleaned")
+            phase("cleaned")
+
+
+for sig in (signal.SIGHUP, signal.SIGTERM):
+    signal.signal(sig, interrupt)
+try:
+    serve()
 except KeyboardInterrupt:
     pass
-except (OSError, ValueError, KeyError) as error:
+except (OSError, ValueError, TypeError, AttributeError, ImportError) as error:
     print(json.dumps({"fatal": str(error)}), flush=True)

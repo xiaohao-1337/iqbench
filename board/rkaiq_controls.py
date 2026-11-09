@@ -9,19 +9,68 @@ class Control(NamedTuple):
     minimum: float | None = None
     maximum: float | None = None
     step: float | None = None
-    choices: tuple[tuple[str, str], ...] = ()
+    choices: tuple[tuple[int | str, str], ...] = ()
     scale: float = 1
 
+    @property
+    def switch(self):
+        return self.step is None and not self.choices
+
+
+CPROC = "/cproc/param"
+GAMMA_PATH = "/agamma_calib_v11/GammaTuningPara"
+GAMMA_CURVE = f"{GAMMA_PATH}/Gamma_curve"
+GRAY_CPSL, GRAY_OFF, GRAY_ON = range(3)
+COLORS = {key: Control(label, f"{CPROC}/{key}", 0, 255, 1) for key, label in (
+    ("brightness", "亮度"), ("contrast", "对比度"), ("saturation", "饱和度"), ("hue", "色相"),
+)}
+MODES = {
+    "gray": Control("黑白模式", "/colorAsGrey/param/enable", choices=((GRAY_OFF, "关闭"), (GRAY_ON, "开启"))),
+    "enable": Control("色彩处理（CPROC）", f"{CPROC}/enable"),
+}
+GAMMA = {
+    "gamma_enable": Control("启用 Gamma", f"{GAMMA_PATH}/Gamma_en"),
+    "gamma_offset": Control("输出偏移", f"{GAMMA_PATH}/Gamma_out_offset", 0, 4095, 1),
+}
 
 EXPOSURE = "/uapi/0/ae_uapi/expsw_attr"
 EXPOSURE_INFO = "/uapi/0/ae_uapi/expinfo"
+WORK_MODE = "/uapi/0/system/work_mode"
+MANUAL_EXPOSURE = "RK_AIQ_OP_MODE_MANUAL"
+EXPOSURE_FRAMES = {
+    "RK_AIQ_WORKING_MODE_NORMAL": 1,
+    "RK_AIQ_WORKING_MODE_ISP_HDR2": 2,
+    "RK_AIQ_WORKING_MODE_ISP_HDR3": 3,
+}
+
+AE_GROUPS = (
+    ("LinearAE", ("ae_time",), ("ae_gain",)),
+    ("HdrAE", tuple(f"hdr{frame}_time" for frame in range(1, 4)),
+     tuple(f"hdr{frame}_gain" for frame in range(1, 4))),
+)
 
 
-AE_CONTROLS = {
+def manual_controls():
+    for group, times, gains in AE_GROUPS:
+        for frame, (time, gain) in enumerate(zip(times, gains)):
+            prefix = "" if group == "LinearAE" else f"HDR 帧 {frame + 1} · "
+            index = "" if group == "LinearAE" else f"/{frame}"
+            path = f"{EXPOSURE}/stManual/{group}"
+            yield time, Control(prefix + "曝光时间 (ms)", f"{path}/TimeValue{index}", step=0.001, scale=1000)
+            yield gain, Control(prefix + "模拟增益 (×)", f"{path}/GainValue{index}", step=0.001)
+
+
+LIVE_AE_CONTROLS = {
     "ae_mode": Control("曝光模式", EXPOSURE + "/AecOpType", choices=(
-        ("RK_AIQ_OP_MODE_AUTO", "自动"), ("RK_AIQ_OP_MODE_MANUAL", "手动"))),
-    "ae_time": Control("曝光时间 (ms)", EXPOSURE + "/stManual/LinearAE/TimeValue", 0.1, 30, 0.1, scale=1000),
-    "ae_gain": Control("模拟增益 (×)", EXPOSURE + "/stManual/LinearAE/GainValue", 1, 31.6, 0.1),
+        ("RK_AIQ_OP_MODE_AUTO", "自动"), (MANUAL_EXPOSURE, "手动"))),
+    **dict(manual_controls()),
+}
+
+# Older desktops construct the linear sliders from these bounds. Live validation uses device ranges.
+AE_CONTROLS = {
+    **LIVE_AE_CONTROLS,
+    "ae_time": LIVE_AE_CONTROLS["ae_time"]._replace(minimum=0.1, maximum=30, step=0.1),
+    "ae_gain": LIVE_AE_CONTROLS["ae_gain"]._replace(minimum=1, maximum=31.6, step=0.1),
 }
 
 EXPOSURE_IQ_CONTROLS = {
@@ -68,4 +117,6 @@ TONE_CONTROLS = {
     "enhance": Control("细节增强", "/adehaze_calib_v11/DehazeTuningPara/enhance_setting/en"),
 }
 
-IQ_CONTROLS = {**EXPOSURE_IQ_CONTROLS, **WB_CONTROLS, **DETAIL_CONTROLS, **TONE_CONTROLS}
+IQ_CONTROLS = {**COLORS, "enable": MODES["enable"], **GAMMA, **EXPOSURE_IQ_CONTROLS,
+               **WB_CONTROLS, **DETAIL_CONTROLS, **TONE_CONTROLS}
+PARAMETERS = {**MODES, **IQ_CONTROLS, **LIVE_AE_CONTROLS}

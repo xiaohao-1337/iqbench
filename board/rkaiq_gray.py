@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Control RKAIQ gray mode and recover the tuning socket on the verified HYEO build."""
 
 import hashlib
@@ -11,37 +10,43 @@ import struct
 import subprocess
 import sys
 
+from rkaiq_controls import GRAY_CPSL, GRAY_OFF, GRAY_ON
+from rkaiq_media import listener_for, owner, server_handles
+
 
 HEADER = struct.Struct("<2sIiiI")
 U32 = struct.Struct("<I")
 GRAY_SET = 0x1250
 GRAY_GET = 0x1251
-MODES = {"cpsl": 0, "off": 1, "on": 2}
-BOARD_SOCKETS = ("/tmp/UNIX.domain1", "/tmp/UNIX.domain2")
 SERVER_SHA256 = "bd7b443fd92bf853c71a1816f2ad8ea5ebeef88601b1fe1a8039f7ec321178c0"
 LIBRARY_SHA256 = "798246f3294240872645eec0e5d51f62525655ff391450e35e6114b62e46747f"
 
-# media_infos has 16 entries of 344 bytes in the verified AArch64 executable.
-# Entry 2 contains the media device path at offset 288 and the AIQ context at 328.
+# Layout of media_infos in the verified AArch64 executable.
+MEDIA_COUNT = 16
 GDB_RECOVERY = """
 import gdb
+import os
 
 try:
     gdb.execute('set scheduler-locking off')
     gdb.execute('set unwindonsignal on')
-    media = int(gdb.parse_and_eval('(char *)&media_infos + 2 * 344'))
+    media = int(gdb.parse_and_eval('(char *)&media_infos + {} * 344'.format(media_index)))
     inferior = gdb.selected_inferior()
-    path = bytes(inferior.read_memory(media + 288, 32)).split(b'\\x00', 1)[0]
+    for offset, size, expected in identity:
+        actual = bytes(inferior.read_memory(media + offset, size)).split(b'\\x00', 1)[0]
+        if actual != expected:
+            raise gdb.GdbError('3A media context does not match the selected camera route')
     ctx = int(gdb.parse_and_eval('*(void **){}'.format(media + 328)))
-    if path != b'/dev/media2' or not ctx:
-        raise gdb.GdbError('Could not validate the active /dev/media2 AIQ context')
-    for enable in (0, 1):
-        result = gdb.parse_and_eval(
-            '((int (*)(void *, int)) &rk_aiq_uapi2_sysctl_tuning_enable)'
-            '((void *){}, {})'.format(ctx, enable)
-        )
-        if int(result) != 0:
-            raise gdb.GdbError('tuning_enable({}) returned {}'.format(enable, result))
+    if not ctx:
+        raise gdb.GdbError('The selected camera has no active AIQ context')
+    if not os.path.lexists(socket_path):
+        for enable in (0, 1):
+            result = gdb.parse_and_eval(
+                '((int (*)(void *, int)) &rk_aiq_uapi2_sysctl_tuning_enable)'
+                '((void *){}, {})'.format(ctx, enable)
+            )
+            if int(result) != 0:
+                raise gdb.GdbError('tuning_enable({}) returned {}'.format(enable, result))
 finally:
     if gdb.selected_inferior().pid:
         gdb.execute('detach')
@@ -103,40 +108,13 @@ def gray_mode(path):
     if len(reply) != U32.size:
         raise OSError("RKAIQ did not return a gray mode value")
     (value,) = U32.unpack(reply)
-    if value not in MODES.values():
+    if value not in (GRAY_CPSL, GRAY_OFF, GRAY_ON):
         raise OSError(f"RKAIQ returned an unknown gray mode value: {value}")
     return value
 
 
-def bound_socket():
-    result = subprocess.run(["pidof", "rkaiq_3A_server"], capture_output=True, text=True)
-    pids = result.stdout.split()
-    if len(pids) != 1:
-        raise OSError("Expected one running rkaiq_3A_server")
-    sensors = set()
-    for fd in (Path("/proc") / pids[0] / "fd").iterdir():
-        try:
-            device = os.readlink(fd)
-        except FileNotFoundError:
-            continue
-        if not device.startswith("/dev/v4l-subdev"):
-            continue
-        name = (Path("/sys/class/video4linux") / Path(device).name / "name").read_text()
-        match = re.match(r"m0([12])_[bf]_imx586\b", name)
-        if match:
-            sensors.add(match[1])
-    if len(sensors) != 1:
-        raise OSError("Could not identify the IMX586 camera owned by rkaiq_3A_server")
-    return f"/tmp/UNIX.domain{sensors.pop()}"
-
-
-def verified_server_pid():
-    result = subprocess.run(["pidof", "rkaiq_3A_server"], capture_output=True, text=True)
-    pids = result.stdout.split()
-    if result.returncode != 0 or len(pids) != 1 or not pids[0].isdecimal():
-        raise OSError("Automatic recovery requires exactly one rkaiq_3A_server process")
-
-    process = Path("/proc") / pids[0]
+def verify_server_build(pid):
+    process = Path("/proc") / pid
     if hashlib.sha256((process / "exe").read_bytes()).hexdigest() != SERVER_SHA256:
         raise OSError("The running rkaiq_3A_server does not match the verified build")
 
@@ -156,12 +134,14 @@ def verified_server_pid():
 
     if hashlib.sha256(library.read_bytes()).hexdigest() != LIBRARY_SHA256:
         raise OSError("The running librkaiq.so does not match the verified build")
-    return pids[0]
 
 
-def recover_socket(path):
+def recover_socket(path, route, pid):
     if sys.platform != "linux" or os.geteuid() != 0:
         raise OSError("Automatic RKAIQ socket recovery requires root on the device")
+    media = re.fullmatch(r"/dev/media(\d+)", route["media"])
+    if not media or int(media[1]) >= MEDIA_COUNT:
+        raise OSError("The selected media device is outside the verified 3A table")
 
     import fcntl
 
@@ -171,14 +151,24 @@ def recover_socket(path):
         fcntl.flock(lock, fcntl.LOCK_EX)
         if os.path.lexists(path):
             return
-        if bound_socket() != path:
-            raise OSError("The requested socket does not belong to the active 3A camera")
-        pid = verified_server_pid()
+        servers = server_handles()
+        if owner(route, servers) != pid or not listener_for(route, path, servers[pid]):
+            raise OSError("Could not confirm the selected camera and socket still belong to the 3A process")
+        verify_server_build(pid)
+        identity = [
+            (192, 64, route["video"].encode()),
+            (256, 32, route["sensor"].encode()),
+            (288, 32, route["media"].encode()),
+        ]
+        script = (
+            f"media_index = {int(media[1])}\nidentity = {identity!r}\n"
+            f"socket_path = {path!r}\n{GDB_RECOVERY}"
+        )
         print("Rebuilding RKAIQ tuning IPC with GDB. Capture may briefly pause.", file=sys.stderr)
         command = [
             "/usr/bin/gdb", "-nx", "-q", "-batch",
             "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
-            "-p", pid, "-ex", f"python exec({GDB_RECOVERY!r})",
+            "-p", pid, "-ex", f"python exec({script!r})",
         ]
         with subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -193,13 +183,3 @@ def recover_socket(path):
                 raise OSError(f"GDB recovery was interrupted:\n{output.strip()}") from None
         if debugger.returncode != 0:
             raise OSError(f"GDB recovery failed:\n{output.strip()}")
-
-
-def initial_gray_mode(path, allow_recovery):
-    try:
-        return gray_mode(path)
-    except FileNotFoundError:
-        if not allow_recovery or path not in BOARD_SOCKETS:
-            raise
-    recover_socket(path)
-    return gray_mode(path)

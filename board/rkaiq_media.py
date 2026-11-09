@@ -16,6 +16,7 @@ SENSOR = re.compile(r"(m(\d+)_[a-z]_)?([\w.-]+)(?:\s|$)")
 
 def topology(text):
     model = driver = name = ""
+    sink_pad = -1
     nodes, sensors, incoming = {}, set(), defaultdict(list)
     for raw in text.splitlines():
         line = raw.strip()
@@ -25,6 +26,7 @@ def topology(text):
             driver = driver_field[1]
         elif entity := re.match(r"- entity \d+: (.+) \(\d+ pads?,", line):
             name = entity[1]
+            sink_pad = -1
         elif line.startswith("device node name "):
             nodes[name] = line.split()[-1]
         elif "subtype Sensor" in line:
@@ -46,7 +48,7 @@ def routes(media):
                 (name, nodes[name]) for name in sensors & linked if name in nodes
             )
 
-    for path, (driver, model, nodes, sensors, incoming) in media.items():
+    for path, (driver, _, nodes, sensors, incoming) in media.items():
         if not driver.startswith("rkisp") or ISP not in nodes or MAINPATH not in nodes:
             continue
         upstream = [source for source, pad in incoming[ISP] if pad == 0]
@@ -63,8 +65,8 @@ def routes(media):
         sensor, sensor_node = next(iter(candidates)) if len(candidates) == 1 else ("", "")
         identity = SENSOR.match(sensor)
         owner_nodes = {nodes[name] for name in (ISP, "rkisp-statistics", "rkisp-input-params") if name in nodes}
-        yield {"video": nodes[MAINPATH], "media": path, "isp": model, "output": MAINPATH,
-               "sensor": sensor, "sensor_node": sensor_node, "owner_nodes": owner_nodes,
+        yield {"video": nodes[MAINPATH], "media": path, "sensor": sensor,
+               "sensor_node": sensor_node, "owner_nodes": owner_nodes,
                "camera_id": int(identity[2]) if identity and identity[2] is not None else None}
 
 
@@ -105,59 +107,73 @@ def server_handles():
 
 
 def owner(route, servers):
-    owners = [pid for pid, handles in servers.items()
-              if route["sensor_node"] in handles and route["owner_nodes"] & handles]
+    owners = [pid for pid, handles in servers.items() if owns_route(route, handles)]
     return owners[0] if len(owners) == 1 else None
 
 
-def socket_handle(path, handles):
+def owns_route(route, handles):
+    return route["sensor_node"] in handles and bool(route["owner_nodes"] & handles)
+
+
+def listener_for(route, path, handles):
+    if not owns_route(route, handles):
+        return None
     for line in Path("/proc/net/unix").read_text().splitlines():
         fields = line.split()
         if len(fields) == 8 and fields[7] == path and int(fields[3], 16) & 0x10000:
             handle = f"socket:[{fields[6]}]"
             if handle in handles:
                 return handle
-    return None
 
 
-def iq_candidates(route):
+def iq_name(path):
+    return path.relative_to(IQ_DIR).as_posix() if path else None
+
+
+def iq_files():
+    files = {iq_name(path): path for path in sorted(IQ_DIR.rglob("*"))
+             if path.suffix.lower() == ".json" and path.is_file()}
+    if not files:
+        raise ValueError("/etc/iqfiles 中没有找到 JSON 文件")
+    return files
+
+
+def iq_choices(route, files):
     sensor = route["sensor"]
-    model = SENSOR.match(sensor)[3]
-    exact = IQ_DIR / f"{sensor}.json"
-    candidates = sorted(p for p in IQ_DIR.glob("*.json") if p.is_file()
-                        and (p == exact or p.stem == model or p.stem.startswith(model + "_")))
-    if not candidates:
-        raise ValueError(f"/etc/iqfiles 中没有找到 {sensor} 的 JSON")
-    return candidates
+    identity = SENSOR.match(sensor)
+    model = identity[3] if identity else sensor
+    lower_sensor, lower_model = sensor.casefold(), model.casefold()
+    matched = [path for path in files.values() if path.stem.casefold() in (lower_sensor, lower_model)
+               or path.stem.casefold().startswith((lower_model + "_", lower_model + "-"))]
+    loaded = loaded_iq(route, owner(route, server_handles()), files.values())
+    preferred = loaded or preferred_iq(route, sensor, model, files, matched)
+    loaded_name = iq_name(loaded)
+    matches = [iq_name(path) for path in matched]
+    choices = list(dict.fromkeys(filter(None, (loaded_name, *matches, *files))))
+    return {"iq_choices": choices, "matched_iq": matches,
+            "preferred_iq": iq_name(preferred), "loaded_iq": loaded_name}
 
 
-def iq_preference(route, pid, candidates):
-    """Keep the full sensor candidate list and distinguish the logged file from a guess."""
-    if pid:
-        logged = logged_iq(route["camera_id"], pid, candidates)
-        if logged:
-            return logged, logged
-
-    sensor = route["sensor"]
-    model = SENSOR.match(sensor)[3]
+def preferred_iq(route, sensor, model, files, matched):
     of_node = Path("/sys/class/video4linux") / Path(route["sensor_node"]).name / "device/of_node"
     try:
         module, lens = ((of_node / f"rockchip,camera-module-{key}").read_bytes().rstrip(b"\0").decode()
                         for key in ("name", "lens-name"))
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     else:
-        named = IQ_DIR / f"{model}_{module}_{lens}.json"
-        if named in candidates:
-            return named, None
-    for named in (IQ_DIR / f"{sensor}.json", IQ_DIR / f"{model}.json"):
-        if named in candidates:
-            return named, None
-    return (candidates[0] if len(candidates) == 1 else None), None
+        filename = f"{model}_{module}_{lens}.json".casefold()
+        names = [path for path in matched if path.name.casefold() == filename]
+        if len(names) == 1:
+            return names[0]
+    return files.get(f"{sensor}.json") or files.get(f"{model}.json") or (matched[0] if len(matched) == 1 else None)
 
 
-def logged_iq(camera_id, pid, candidates):
-    # Match this camera ID and process lifetime, including logs relayed by systemd.
+def loaded_iq(route, pid, candidates):
+    camera_id = route["camera_id"]
+    if not pid or camera_id is None:
+        return None
+    # Match the camera ID and process lifetime; systemd may relay the log.
     try:
         stat = (Path("/proc") / pid / "stat").read_text()
         started = int(stat.rsplit(")", 1)[1].split()[19]) * 1_000_000 // os.sysconf("SC_CLK_TCK")
@@ -179,4 +195,10 @@ def logged_iq(camera_id, pid, candidates):
             logged = Path(match[1])
             if logged in candidates:
                 return logged
+            try:
+                same_file = [candidate for candidate in candidates if candidate.resolve() == logged.resolve(strict=True)]
+            except (OSError, RuntimeError):
+                continue
+            if len(same_file) == 1:
+                return same_file[0]
     return None

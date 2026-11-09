@@ -1,0 +1,9 @@
+RKAIQ 在线调参工作台 · Windows 11 x64
+
+1. 完整解压 ZIP，保留 RKAIQWorkbench.exe 和同目录的 _internal。
+2. 双击 RKAIQWorkbench.exe。确认电脑能通过网络访问板卡。
+3. 确认或修改预填的设备 IP、账号和密码，连接后选择 ISP 主链路和 IQ 基线文件。
+4. 调参完成后，点「全局保存 JSON」并选择本机路径。由你自行替换板卡的 IQ 文件。
+5. 使用「退出」关闭，等待板端临时会话清理完成。
+
+第三方组件许可与源码位置见 licenses/THIRD-PARTY.txt。
